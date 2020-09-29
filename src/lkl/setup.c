@@ -77,6 +77,10 @@
 #define BOOTARGS_CONSOLE_OPTION "console=hvc0"
 #define BOOTARGS_QUIET_OPTION "quiet"
 
+#ifndef EXT4_IOC_GETFSBLK_ID
+#define EXT4_IOC_GETFSBLK_ID 		_IOR('f', 33,long)
+#endif
+
 int sethostname(const char*, size_t);
 
 int sgxlkl_trace_lkl_syscall = 0;
@@ -90,7 +94,11 @@ int sgxlkl_trace_thread = 0;
 int sgxlkl_trace_disk = 0;
 int sgxlkl_use_host_network = 0;
 int sgxlkl_mtu = 0;
+int sgxlkl_batch_vio_reqs = 0;
 
+int dummy_file_for_fake_reads = 0;
+char *dummy_file_name = "/dummyfile.out";
+long long * fileblk_to_fsblk_map; 
 extern struct timespec sgxlkl_app_starttime;
 
 /* Function to setup bounce buffer in LKL */
@@ -605,6 +613,22 @@ static void lkl_mount_virtual()
     lkl_mknods();
 }
 
+static int dummy_file_exists = 0;
+void lkl_setup_dummy_file_blocks() {
+    if (!dummy_file_exists) {
+        dummy_file_for_fake_reads = lkl_sys_open(dummy_file_name, O_CREAT | O_RDWR, S_IRUSR);
+        int res = posix_fallocate(dummy_file_for_fake_reads, 0, 4096000);
+        if (res != 0) {
+            sgxlkl_fail("fallocate failure %s \n", lkl_strerror(res));
+        }
+        dummy_file_exists = 1;
+    }
+
+    if (dummy_file_for_fake_reads < 0) {
+        sgxlkl_fail("Error: lkl_sys_open %s\n", lkl_strerror(0));
+    }
+} 
+
 static void lkl_mount_disk(
     disk_config_t* disk,
     char device,
@@ -741,6 +765,7 @@ static void lkl_mount_disk(
         sgxlkl_fail("lkl_mount_blockdev()=%s (%d)\n", lkl_strerror(err), err);
 
     sgxlkl_enclave_state.disk_state[disk_index].mounted = true;
+    lkl_setup_dummy_file_blocks();
 }
 
 static void lkl_mount_root_disk(
