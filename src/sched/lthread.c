@@ -35,6 +35,8 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <assert.h>
+#include <pthread.h>
 
 #include "stdio_impl.h"
 
@@ -45,11 +47,28 @@
 #include "enclave/lthread_int.h"
 #include "enclave/sgxlkl_t.h"
 #include "enclave/ticketlock.h"
+#include "enclave/mpmc_queue.h"
 #include "openenclave/corelibc/oemalloc.h"
 #include "openenclave/corelibc/oestring.h"
 #include "openenclave/internal/safecrt.h"
+#include "oblivious/frag.h"
+#include "host/virtio_dev.h"
+#include "host/virtio_blkdev.h"
+#include "host/host_state.h"
+#include "lkl/setup.h"
+
+struct virtio_req_queue_slot
+{
+    struct virtio_req* req;
+    struct virtio_dev* dev;
+    struct virtq* q;
+    uint16_t idx;
+};
+
+struct mpmcq *idx_queue;
 
 extern int vio_enclave_wakeup_event_channel(void);
+extern int blk_enqueue(struct virtio_dev* dev, int q, struct virtio_req* req);
 
 static void _exec(void* lt);
 static void _lthread_init(struct lthread* lt);
@@ -57,6 +76,34 @@ static void _lthread_lock(struct lthread* lt);
 static void lthread_rundestructors(struct lthread* lt);
 
 #define TLS_ALIGN 16
+/* Bit array operations. Used for storing the offsets that are seen
+ * in read() and write() calls. */
+#define BITMASK(b) (1 << ((b) % CHAR_BIT))
+#define BITSLOT(b) ((b) / CHAR_BIT)
+#define BITSET(a, b) ((a)[BITSLOT(b)] |= BITMASK(b))
+#define BITCLEAR(a, b) ((a)[BITSLOT(b)] &= ~BITMASK(b))
+#define BITTEST(a, b) ((a)[BITSLOT(b)] & BITMASK(b))
+#define BITNSLOTS(nb) ((nb + CHAR_BIT - 1) / CHAR_BIT)
+
+char blockbitmap[BITNSLOTS(MAXBLOCKS)];
+
+void block_bitmap_init() {
+	memset(blockbitmap, 0, BITNSLOTS(MAXBLOCKS));
+
+}
+
+void block_bitmap_set(long long offset, long count) {
+	int num_blocks_to_set = count/4096;
+	for(int i = 0; i < num_blocks_to_set; i++) {
+		long long curr_offset = offset + (i * 4096);
+		assert(curr_offset % 4096 == 0);
+	        curr_offset = curr_offset/4096;
+		assert(curr_offset < MAXBLOCKS);
+		if(!BITTEST(blockbitmap, curr_offset)) {
+			BITSET(blockbitmap, curr_offset);
+		}
+	}
+}
 
 static int spawned_ethreads = 1;
 
@@ -82,6 +129,8 @@ static inline int _lthread_sleep_cmp(struct lthread* l1, struct lthread* l2)
 
 static int spawned_lthreads = 1;
 
+static struct timespec prev_time = {0,0};
+
 // Record the scheduler that runs the lthread responsible for termination
 static _Atomic(struct lthread_sched*) _lthread_terminating_scheduler = NULL;
 
@@ -90,6 +139,150 @@ static size_t sleeptime_ns = 1600;
 static size_t futex_wake_spins = 500;
 
 int thread_count = 1;
+
+// Globals for hiding disk I/O calls
+long long batch_interval;
+uint64_t read_write_per_batch;
+int sgxlkl_issue_fake_syscalls = 0;
+long fake_reads_count = 0;
+long fake_writes_count = 0;
+long real_reads_count = 0;
+long real_writes_count = 0;
+long batch_count = 0;
+int curr_fake_block_no = 0;
+
+// Globals for shuffling disk blocks
+uint64_t shuffle_interval;
+int execute_shuffle = 0;
+int sgxlkl_shuffle_all_files = 0;
+char *file_names[MAX_NUM_OF_FILES];
+char *shuffle_file_names[MAX_NUM_OF_FILES];
+char *fd_used_since_last_shuffle[MAX_NUM_OF_FILES] = {0};
+int *open_files_bitmap = {0};
+int num_fd_to_close_after_shuffle = 0;
+int is_shuffle_needed = 0;
+
+pthread_mutex_t shuffle_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Buffer storing virtio requests to execute in batches */
+int sgxlkl_batch_vio_reqs;
+struct virtio_req_queue_slot* virtio_req_queue;
+struct ticketlock virtio_req_queue_lock;
+struct virtio_req_queue_slot* virtio_req_batch_to_issue;
+struct ticketlock virtio_req_batch_to_issue_lock;
+uint8_t virtio_req_queue_count;
+
+struct lthread *shuffle_lock_owner = NULL;
+volatile int lkl_startup_complete = 0;
+extern ssize_t pread(int fd, void *buf, size_t size, off_t ofs);
+extern ssize_t pwrite(int fd, const void *buf, size_t size, off_t ofs);
+
+/* Save virtio requests to virtio request queue for batching */
+// static void get_and_fill_virtio_req_queue(struct virtio_req *request, struct virtio_dev *device, struct virtq *virtq) {
+//     uint8_t virtio_req_queue_index;
+
+//     /* Get slot */
+//     ticket_lock(&virtio_req_queue_lock);
+//     virtio_req_queue_index = virtio_req_queue_count;
+//     virtio_req_queue_count++;
+
+//     /* Fill slot */
+//     struct virtio_req_queue_slot *slot = &virtio_req_queue[virtio_req_queue_index];
+//     slot->req = request;
+//     slot->dev = device;
+//     slot->q = virtq;
+//     ticket_unlock(&virtio_req_queue_lock);
+// }
+
+/* Get the mapping from file block to filesystem block. There is a new ioctl EXT4_IOC_GETFSBLK_ID 
+   populates a map of file blocks to file system blocks. This is done during initialization and we 
+   just access that map here. Avoids the need to do an ioctl call each time a dummy block is needed */ 
+long long get_next_fake_DR_block() {
+	if(fileblk_to_fsblk_map) { 
+		long long fs_blk_id = fileblk_to_fsblk_map[curr_fake_block_no];
+		curr_fake_block_no = (curr_fake_block_no+1)%1000; 
+		return fs_blk_id; 
+	}
+	return -1; 
+}
+
+sgxlkl_host_state_t sgxlkl_host_state;
+void issue_virtio_reqs(struct virtio_req_queue_slot *requests, uint8_t batch_size_to_issue) {
+    int reads_per_batch_count = read_write_per_batch;
+    int writes_per_batch_count = read_write_per_batch;
+    for (uint8_t i = 0; i < batch_size_to_issue; i++) {
+        struct virtio_req_queue_slot *real_virtio_req = requests + i;
+	struct virtio_blk_outhdr* h = real_virtio_req->req->buf[0].iov_base;
+        uint32_t req_type = h->type;
+        if (req_type == LKL_DEV_BLK_TYPE_READ) {
+            reads_per_batch_count--;
+            real_reads_count++;
+        } else if (req_type == LKL_DEV_BLK_TYPE_WRITE) {
+            writes_per_batch_count--;
+            real_writes_count++;
+        }
+        // This causes undefined reference, not sure why
+        // blk_enqueue(real_virtio_req->dev, 0, real_virtio_req->req); 
+    }
+
+    uint8_t blkdev_id = requests->dev->vendor_id;
+    sgxlkl_host_disk_state_t* disk = &sgxlkl_host_state.disks[blkdev_id];
+    int fd = disk->fd;
+
+    if(lkl_startup_complete && !is_lkl_terminating() && sgxlkl_issue_fake_syscalls) { 
+        for (uint8_t i = 0; i < reads_per_batch_count; i++) {
+            int block_id = get_next_fake_DR_block();
+            char buf[1024] = {0}; 
+            if(block_id >= 0) {
+                pread(fd, buf, 1024, block_id);
+                fake_reads_count++; 
+            } 
+        }
+
+        for (uint8_t j = 0; j < writes_per_batch_count; j++) {
+            int block_id = get_next_fake_DR_block();
+            char buf[1024];
+            if(block_id >= 0) {
+                pwrite(fd, buf, 1024, block_id);
+                fake_writes_count++; 
+            } 
+        }
+    }
+}
+
+int create_current_batch() {
+	int reads_per_batch_count = read_write_per_batch;
+	int writes_per_batch_count = read_write_per_batch;
+	int curr_batch_index = 0;
+	int virtio_req_queue_new_count = 0;
+	for(int i = 0; i < virtio_req_queue_count; i++) {
+        struct virtio_req_queue_slot *real_virtio_req = virtio_req_queue + i;
+        struct virtio_blk_outhdr* h = real_virtio_req->req->buf[0].iov_base;
+        uint32_t req_type = h->type;
+		if((req_type == LKL_DEV_BLK_TYPE_READ) || (req_type == LKL_DEV_BLK_TYPE_WRITE)) {
+			if((req_type == LKL_DEV_BLK_TYPE_READ) && (writes_per_batch_count > 0)) {
+				reads_per_batch_count--;
+				memcpy(virtio_req_batch_to_issue + curr_batch_index, virtio_req_queue + i, sizeof(struct virtio_req_queue_slot));
+				curr_batch_index++;
+			}  else if ((req_type == LKL_DEV_BLK_TYPE_WRITE) && (reads_per_batch_count > 0)) {
+				writes_per_batch_count--;
+				memcpy(virtio_req_batch_to_issue + curr_batch_index, virtio_req_queue + i, sizeof(struct virtio_req_queue_slot));
+				curr_batch_index++;
+			}
+			else {
+				memcpy(virtio_req_queue + virtio_req_queue_new_count, virtio_req_queue + i, sizeof(struct virtio_req_queue_slot));
+				virtio_req_queue_new_count++;
+			}
+		} else {
+			memcpy(virtio_req_batch_to_issue + curr_batch_index, virtio_req_queue + i, sizeof(struct virtio_req_queue_slot));
+			curr_batch_index++;
+		}
+	}
+
+	uint8_t batch_size_to_issue = curr_batch_index;
+	virtio_req_queue_count = virtio_req_queue_new_count;
+	return batch_size_to_issue;
+}
 
 #if DEBUG
 struct ticketlock _lt_active_threads_lock;
@@ -150,6 +343,76 @@ __asm__("    .text                                  \n"
         "       movq %rdx, (%rsp)                                \n"
         "       ret                                              \n");
 #endif
+
+void acquire_shuffle_lock(void) {
+    if(!lkl_startup_complete)
+	return;
+    struct lthread * lt = lthread_self();
+
+    if  (shuffle_lock_owner == lt)
+	return;
+
+    if(pthread_mutex_lock(&shuffle_mutex) != 0)
+	sgxlkl_error("Unable to acquire the shuffle mutex lock");  
+    else
+	shuffle_lock_owner = lt;
+}
+
+void release_shuffle_lock() {
+	if(!lkl_startup_complete)
+		return;
+	struct lthread * lt = lthread_self();
+
+	if (shuffle_lock_owner == lt) {
+		shuffle_lock_owner = NULL;
+		pthread_mutex_unlock(&shuffle_mutex);
+	}
+	return;
+}
+
+int check_and_issue_syscall_batch() { 
+	while(!lkl_startup_complete) {}; 
+	struct timespec curr_time;
+	clock_gettime(CLOCK_REALTIME, &curr_time);
+	uint64_t elapsed_ns = (curr_time.tv_sec - prev_time.tv_sec) * 1000000000 + (curr_time.tv_nsec - prev_time.tv_nsec);
+
+	if (elapsed_ns <= batch_interval) return -1;  // Not enough time has passed
+
+	if (ticket_trylock(&virtio_req_queue_lock) == EBUSY) {
+		return -1; // Someone already has the lock -- don't block waiting for them
+	}
+	ticket_lock(&virtio_req_batch_to_issue_lock); 
+	uint8_t batch_size_to_issue = create_current_batch();
+	prev_time = curr_time;
+	ticket_unlock(&virtio_req_queue_lock);
+
+	issue_virtio_reqs(virtio_req_batch_to_issue, batch_size_to_issue);
+	ticket_unlock(&virtio_req_batch_to_issue_lock);
+	return 1; 
+}
+
+static void perform_shuffle(struct lthread *lt) {
+	is_shuffle_needed = 0;
+	lt->ongoing_shuffle = 1;
+
+	SGXLKL_TRACE_THREAD("[tid=%-3d] shuffle thread starting shuffle:  tid=%d count=%d\n", (lthread_self() ? lthread_self()->tid : 0), lt->tid, thread_count);
+	do_frag();
+	SGXLKL_TRACE_THREAD("[tid=%-3d] shuffle thread finished shuffle:  tid=%d count=%d\n", (lthread_self() ? lthread_self()->tid : 0), lt->tid, thread_count);
+
+	lt->ongoing_shuffle = 0;
+}
+
+int perform_shuffle_if_needed() {
+	struct lthread *lt = lthread_self();
+	if (lt->ongoing_shuffle) {
+		return -1;
+	}
+	if (!lt->is_shuffle_thread) {
+		return 0;
+	}
+	perform_shuffle(lt);
+	return 1;
+}
 
 static inline struct lthread* lthread_alloc()
 {
