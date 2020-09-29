@@ -146,8 +146,10 @@ struct lthread
     struct lthread_tls_l tls;     /* pointer to TLS */
     uint8_t* itls;                /* image TLS */
     size_t itlssz;                /* size of TLS image */
-    uintptr_t* tp;                 /* thread pointer */
+    uintptr_t* tp;                /* thread pointer */
     int err;                      /* errno value */
+    int ongoing_shuffle;          /* whether lthread has an ongoing shuffle */
+    int is_shuffle_thread;        /* whether lthread is shuffle thread */
     /* yield_cb_* are a callback to call after yield finished and it's arg */
     /* they are required to release futex lock on FUTEX_WAIT operation */
     /* and in sched_yield (see comment there) to avoid race among schedulers */
