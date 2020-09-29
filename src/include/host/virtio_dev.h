@@ -4,12 +4,20 @@
 #include <linux/virtio_ids.h>
 #include <sys/uio.h>
 
+#ifndef BIT
 #define BIT(x) (1ULL << x)
+#endif
 
 #define VIRTIO_F_VERSION_1 32
 #define VIRTIO_RING_F_EVENT_IDX 29
 #define VIRTIO_F_IOMMU_PLATFORM 33
 
+extern int sgxlkl_batch_vio_reqs;
+extern struct virtio_req_queue_slot* virtio_req_queue;
+extern struct ticketlock virtio_req_queue_lock;
+extern struct virtio_req_queue_slot* virtio_req_batch_to_issue;
+extern struct ticketlock virtio_req_batch_to_issue_lock;
+extern uint8_t virtio_req_queue_count;
 struct virtio_dev;
 
 struct virtio_req
