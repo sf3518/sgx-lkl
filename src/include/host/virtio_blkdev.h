@@ -7,7 +7,7 @@
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
-
+#endif
 
 /* The following are copied from skbuff.h */
 #if (65536 / PAGE_SIZE + 1) < 16
